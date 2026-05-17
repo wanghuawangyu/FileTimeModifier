@@ -1,6 +1,6 @@
 package com.example.filemod
 
-import android.content.ContentResolver
+import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -20,17 +20,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import java.io.File
+import java.io.FileOutputStream
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
-import android.content.ContentValues
-import android.provider.MediaStore.Images
-import android.provider.MediaStore.Video
-import android.provider.MediaStore.Files
 
 // ─── 工具函数 ───
-
 fun getFileName(context: Context, uri: Uri): String? {
     val cursor = context.contentResolver.query(uri, null, null, null, null)
     return cursor?.use {
@@ -41,62 +37,40 @@ fun getFileName(context: Context, uri: Uri): String? {
 }
 
 fun getRealPathFromUri(context: Context, uri: Uri): String? {
-    // 1. 文件 scheme 直接返回
-    if (ContentResolver.SCHEME_FILE == uri.scheme) {
+    if (android.content.ContentResolver.SCHEME_FILE == uri.scheme) {
         return uri.path
     }
-
-    // 2. 处理文档 URI（例如 image:23090）
     if (DocumentsContract.isDocumentUri(context, uri)) {
         val docId = DocumentsContract.getDocumentId(uri)
-        // URL 解码，将 %3A 还原为冒号
         val decodedId = Uri.decode(docId)
         val split = decodedId.split(":").toTypedArray()
         val type = split[0]
         val id = if (split.size > 1) split[1] else ""
-
-        // 主存储 primary
         if ("primary".equals(type, ignoreCase = true)) {
             return "${Environment.getExternalStorageDirectory().absolutePath}/$id"
         }
-
-        // 媒体类型（image/video/audio）
         if (type == "image" || type == "video" || type == "audio") {
-            val contentUri: Uri = when (type) {
+            val contentUri = when (type) {
                 "image" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
                 "video" -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
                 else -> MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
             }
             val selection = "_id=?"
-            val selectionArgs = arrayOf(id)
-            context.contentResolver.query(
-                contentUri,
-                arrayOf(MediaStore.MediaColumns.DATA),
-                selection,
-                selectionArgs,
-                null
-            )?.use { cursor ->
+            context.contentResolver.query(contentUri, arrayOf(MediaStore.MediaColumns.DATA), selection, arrayOf(id), null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
-                    val columnIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
-                    return cursor.getString(columnIndex)
+                    return cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA))
                 }
             }
         }
     }
-
-    // 3. 通用 DATA 列查询
     try {
-        context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)
-            ?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val columnIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
-                    val path = cursor.getString(columnIndex)
-                    if (!path.isNullOrEmpty()) return path
-                }
+        context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val path = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA))
+                if (!path.isNullOrEmpty()) return path
             }
+        }
     } catch (_: Exception) {}
-
-    // 4. 尝试 _data 列（大小写不敏感）
     try {
         context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -108,41 +82,87 @@ fun getRealPathFromUri(context: Context, uri: Uri): String? {
             }
         }
     } catch (_: Exception) {}
-
     return null
 }
 
-fun copyUriToTempFile(context: Context, uri: Uri): File? {
-    return try {
-        val inputStream = context.contentResolver.openInputStream(uri) ?: return null
-        val tempFile = File(context.cacheDir, "temp_${System.currentTimeMillis()}")
-        tempFile.outputStream().use { output ->
-            inputStream.copyTo(output)
+fun updateMediaStoreTimestamp(context: Context, mediaUri: Uri, timestamp: Long) {
+    try {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DATE_MODIFIED, timestamp / 1000)
         }
-        inputStream.close()
-        tempFile
+        val isImage = mediaUri.toString().contains("image", true)
+        val isVideo = mediaUri.toString().contains("video", true)
+        if (isImage || isVideo) {
+            values.put(MediaStore.Images.Media.DATE_TAKEN, timestamp)
+        }
+        context.contentResolver.update(mediaUri, values, null, null)
     } catch (e: Exception) {
-        Log.e("TimeModifier", "复制文件失败: $e")
-        null
+        Log.e("TimeModifier", "MediaStore更新失败", e)
     }
 }
 
-fun writeFileBackToUri(context: Context, uri: Uri, tempFile: File): Boolean {
-    return try {
-        val outputStream = context.contentResolver.openOutputStream(uri, "wt") ?: return false
-        tempFile.inputStream().use { input ->
-            input.copyTo(outputStream)
+/**
+ * 通过复制-删除-重命名的方式修改文件的所有时间属性（包括创建时间）
+ */
+fun modifyFileByCopyRename(context: Context, uri: Uri, targetTimeMillis: Long): Boolean {
+    val tempFile = File.createTempFile("filemod_", ".tmp", context.cacheDir)
+    try {
+        // 1. 复制原文件内容到临时文件
+        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            FileOutputStream(tempFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        } ?: return false
+
+        // 2. 修改临时文件的时间（会用作新文件的时间）
+        tempFile.setLastModified(targetTimeMillis)
+
+        // 3. 获取原文件路径
+        val originalPath = getRealPathFromUri(context, uri)
+        if (originalPath == null) {
+            tempFile.delete()
+            return false
         }
-        outputStream.close()
-        true
+        val originalFile = File(originalPath)
+        if (!originalFile.exists()) {
+            tempFile.delete()
+            return false
+        }
+
+        // 4. 删除原文件
+        if (!originalFile.delete()) {
+            tempFile.delete()
+            return false
+        }
+
+        // 5. 将临时文件内容写入原路径（相当于创建新文件）
+        FileOutputStream(originalFile).use { output ->
+            tempFile.inputStream().use { input -> input.copyTo(output) }
+        }
+
+        // 6. 再次设置新文件的最后修改时间（确保精确）
+        originalFile.setLastModified(targetTimeMillis)
+
+        // 7. 删除临时文件
+        tempFile.delete()
+
+        // 8. 通知媒体库更新
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(originalFile.absolutePath),
+            null
+        ) { _, mediaUri ->
+            if (mediaUri != null) updateMediaStoreTimestamp(context, mediaUri, targetTimeMillis)
+        }
+        return true
     } catch (e: Exception) {
-        Log.e("TimeModifier", "覆盖文件失败: $e")
-        false
+        Log.e("TimeModifier", "复制修改失败", e)
+        if (tempFile.exists()) tempFile.delete()
+        return false
     }
 }
 
 // ─── 主界面 ───
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FileTimeModifierApp() {
@@ -153,6 +173,9 @@ fun FileTimeModifierApp() {
     var selectedDate by remember { mutableStateOf(LocalDate.now()) }
     var selectedTime by remember { mutableStateOf(LocalTime.now()) }
     var showConfirmDialog by remember { mutableStateOf(false) }
+
+    // 记录当前选择的修改模式： "direct" 或 "copy"
+    var modifyMode by remember { mutableStateOf("") }
     val context = LocalContext.current
 
     val fileLauncher = rememberLauncherForActivityResult(
@@ -182,6 +205,7 @@ fun FileTimeModifierApp() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        // 按钮区域：左侧浏览，右侧两个操作按钮垂直排列
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
@@ -189,19 +213,36 @@ fun FileTimeModifierApp() {
             Button(onClick = { fileLauncher.launch("*/*") }) {
                 Text("浏览")
             }
-            Button(onClick = {
-                if (selectedUris.isEmpty()) {
-                    Toast.makeText(context, "请先选择文件", Toast.LENGTH_SHORT).show()
-                } else {
-                    showDatePicker = true
+
+            Column(horizontalAlignment = Alignment.End) {
+                Button(onClick = {
+                    if (selectedUris.isEmpty()) {
+                        Toast.makeText(context, "请先选择文件", Toast.LENGTH_SHORT).show()
+                    } else {
+                        modifyMode = "direct"
+                        showDatePicker = true
+                    }
+                }) {
+                    Text("修改源文件时间")
                 }
-            }) {
-                Text("设置时间")
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(onClick = {
+                    if (selectedUris.isEmpty()) {
+                        Toast.makeText(context, "请先选择文件", Toast.LENGTH_SHORT).show()
+                    } else {
+                        modifyMode = "copy"
+                        showDatePicker = true
+                    }
+                }) {
+                    Text("创建文件修改时间")
+                }
             }
         }
     }
 
-    // 日期选择
+    // 日期选择对话框（与之前相同）
     if (showDatePicker) {
         val datePickerState = rememberDatePickerState()
         DatePickerDialog(
@@ -224,7 +265,7 @@ fun FileTimeModifierApp() {
         }
     }
 
-    // 时间选择
+    // 时间选择对话框
     if (showTimePicker) {
         val timePickerState = rememberTimePickerState()
         AlertDialog(
@@ -244,15 +285,21 @@ fun FileTimeModifierApp() {
         )
     }
 
-    // 最终确认
+    // 最终确认对话框（根据模式显示不同提示）
     if (showConfirmDialog) {
         val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
         val timeStr = LocalDateTime.of(selectedDate, selectedTime).format(formatter)
+        val modeText = if (modifyMode == "direct") {
+            "（直接修改源文件的最后修改时间）"
+        } else {
+            "（通过复制-删除-重命名修改所有时间，包括创建时间）"
+        }
+
         AlertDialog(
             onDismissRequest = { showConfirmDialog = false },
             title = { Text("确认修改") },
             text = {
-                Text("将所选文件的修改时间设置为：\n$timeStr\n\n（注：创建时间受系统限制无法直接修改）")
+                Text("将所选文件的时间设置为：\n$timeStr\n$modeText")
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -261,42 +308,24 @@ fun FileTimeModifierApp() {
 
                     var successCount = 0
                     selectedUris.forEach { uri ->
-                        // 尝试直接路径修改
-                        val path = getRealPathFromUri(context, uri)
-                        if (path != null) {
-                            val file = File(path)
-                            val result = file.setLastModified(timestamp)
-                            Log.d("TimeModifier", "直接修改 $path -> $result")
-                            if (result) {
-                                successCount++
-                                // 异步扫描，并在扫描后更新数据库精确时间
-                                MediaScannerConnection.scanFile(
-                                    context,
-                                    arrayOf(path),
-                                    null
-                                ) { scannedPath, mediaUri ->
-                                    if (mediaUri != null) {
-                                        updateMediaStoreTimestamp(context, mediaUri, timestamp)
+                        val ok = if (modifyMode == "direct") {
+                            // 直接修改源文件时间
+                            val path = getRealPathFromUri(context, uri)
+                            if (path != null) {
+                                val file = File(path)
+                                val result = file.setLastModified(timestamp)
+                                if (result) {
+                                    MediaScannerConnection.scanFile(context, arrayOf(path), null) { _, mediaUri ->
+                                        if (mediaUri != null) updateMediaStoreTimestamp(context, mediaUri, timestamp)
                                     }
                                 }
-                                return@forEach
-                            }
+                                result
+                            } else false
+                        } else {
+                            // 通过复制-删除-重命名修改所有时间
+                            modifyFileByCopyRename(context, uri, timestamp)
                         }
-
-                        // 路径获取失败，使用复制-修改-覆盖
-                        Log.d("TimeModifier", "尝试复制方式处理 $uri")
-                        val tempFile = copyUriToTempFile(context, uri)
-                        if (tempFile != null) {
-                            if (tempFile.setLastModified(timestamp)) {
-                                if (writeFileBackToUri(context, uri, tempFile)) {
-                                    successCount++
-                                    // 覆盖后通知 ContentResolver 变化，并更新数据库
-                                    context.contentResolver.notifyChange(uri, null)
-                                    updateMediaStoreTimestamp(context, uri, timestamp)
-                                }
-                            }
-                            tempFile.delete()
-                        }
+                        if (ok) successCount++
                     }
                     showConfirmDialog = false
                     Toast.makeText(context, "已处理 $successCount/${selectedUris.size} 个文件", Toast.LENGTH_SHORT).show()
@@ -306,23 +335,5 @@ fun FileTimeModifierApp() {
                 TextButton(onClick = { showConfirmDialog = false }) { Text("取消") }
             }
         )
-    }
-}
-
-fun updateMediaStoreTimestamp(context: Context, mediaUri: Uri, timestamp: Long) {
-    try {
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DATE_MODIFIED, timestamp / 1000) // 单位：秒
-        }
-        // 如果是图片或视频，也尝试更新 DATE_TAKEN（拍摄时间）
-        val isImage = mediaUri.toString().contains("image", ignoreCase = true)
-        val isVideo = mediaUri.toString().contains("video", ignoreCase = true)
-        if (isImage || isVideo) {
-            values.put(MediaStore.Images.Media.DATE_TAKEN, timestamp)
-        }
-        context.contentResolver.update(mediaUri, values, null, null)
-        Log.d("TimeModifier", "MediaStore 更新成功: $mediaUri")
-    } catch (e: Exception) {
-        Log.e("TimeModifier", "MediaStore 更新失败: $e")
     }
 }
