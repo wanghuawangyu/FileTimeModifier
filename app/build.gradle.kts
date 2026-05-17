@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
-    // 注释掉或删除下面这一行
-    // id("org.jetbrains.kotlin.android")
+    // AGP 9.2.1 已内置 Kotlin Android 插件，无需重复声明
     id("org.jetbrains.kotlin.plugin.compose") version "2.2.10"
 }
 
@@ -35,13 +34,13 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.10.1")
     implementation("androidx.activity:activity-compose:1.8.0")
-    // 使用你指定的 Compose BOM
-    implementation(platform("androidx.compose:compose-bom:2024.06.00"))  // 更稳定的版本
+    implementation(platform("androidx.compose:compose-bom:2026.02.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.1")
+    // 提供稳定的 Material Components 主题
     implementation("com.google.android.material:material:1.12.0")
 
     testImplementation("junit:junit:4.13.2")
@@ -49,7 +48,7 @@ dependencies {
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }
 
-// 自动构建 Rust 库
+// 自动编译 Rust 库
 tasks.register<Exec>("buildRustLib") {
     workingDir = file("../rust_core")
     commandLine(
