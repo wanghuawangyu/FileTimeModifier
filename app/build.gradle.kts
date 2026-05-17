@@ -26,7 +26,9 @@ android {
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs {
+                setSrcDirs(listOf("src/main/jniLibs"))
+            }
         }
     }
 }
@@ -49,18 +51,18 @@ dependencies {
 }
 
 // 自动编译 Rust 库
-tasks.register<Exec>("buildRustLib") {
-    workingDir = file("../rust_core")
-    commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        "-t", "armeabi-v7a",
-        "-t", "x86_64",
-        "-o", "../app/src/main/jniLibs",
-        "build", "--release"
-    )
-}
+//tasks.register<Exec>("buildRustLib") {
+//    workingDir = file("../rust_core")
+//    commandLine(
+//        "cargo", "ndk",
+//        "-t", "arm64-v8a",
+//        "-t", "armeabi-v7a",
+//        "-t", "x86_64",
+//        "-o", "../app/src/main/jniLibs",
+//        "build", "--release"
+//    )
+//}
 
 tasks.named("preBuild") {
-    dependsOn("buildRustLib")
+//    dependsOn("buildRustLib")
 }
