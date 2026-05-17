@@ -27,6 +27,7 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
 // ─── 工具函数 ───
+
 fun getFileName(context: Context, uri: Uri): String? {
     val cursor = context.contentResolver.query(uri, null, null, null, null)
     return cursor?.use {
@@ -102,65 +103,82 @@ fun updateMediaStoreTimestamp(context: Context, mediaUri: Uri, timestamp: Long) 
 }
 
 /**
- * 通过复制-删除-重命名的方式修改文件的所有时间属性（包括创建时间）
+ * 通过创建临时文件、移动原文件、重命名来修改文件时间
+ * 1. 在同级目录创建 .原文件名.tmp
+ * 2. 复制内容并设置目标时间
+ * 3. 原文件移动到 DCIM/.Trash
+ * 4. 临时文件重命名为原文件名
  */
-fun modifyFileByCopyRename(context: Context, uri: Uri, targetTimeMillis: Long): Boolean {
-    val tempFile = File.createTempFile("filemod_", ".tmp", context.cacheDir)
+fun modifyFileByCreateTemp(context: Context, uri: Uri, targetTimeMillis: Long): Boolean {
+    val originalPath = getRealPathFromUri(context, uri) ?: return false
+    val originalFile = File(originalPath)
+    if (!originalFile.exists()) return false
+
+    val parentDir = originalFile.parentFile ?: return false
+    val tempFileName = ".${originalFile.name}.tmp"
+    val tempFile = File(parentDir, tempFileName)
+
     try {
         // 1. 复制原文件内容到临时文件
-        context.contentResolver.openInputStream(uri)?.use { inputStream ->
-            FileOutputStream(tempFile).use { outputStream ->
-                inputStream.copyTo(outputStream)
+        originalFile.inputStream().use { input ->
+            FileOutputStream(tempFile).use { output ->
+                input.copyTo(output)
             }
-        } ?: return false
-
-        // 2. 修改临时文件的时间（会用作新文件的时间）
-        tempFile.setLastModified(targetTimeMillis)
-
-        // 3. 获取原文件路径
-        val originalPath = getRealPathFromUri(context, uri)
-        if (originalPath == null) {
-            tempFile.delete()
-            return false
         }
-        val originalFile = File(originalPath)
-        if (!originalFile.exists()) {
+
+        // 2. 设置临时文件的最后修改时间
+        if (!tempFile.setLastModified(targetTimeMillis)) {
+            Log.e("TimeModifier", "设置临时文件时间失败")
             tempFile.delete()
             return false
         }
 
-        // 4. 删除原文件
-        if (!originalFile.delete()) {
+        // 3. 移动原文件到回收站
+        val trashDir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+            ".Trash"
+        )
+        if (!trashDir.exists()) trashDir.mkdirs()
+
+        val trashFile = if (File(trashDir, originalFile.name).exists()) {
+            File(trashDir, "${originalFile.nameWithoutExtension}_${System.currentTimeMillis()}.${originalFile.extension}")
+        } else {
+            File(trashDir, originalFile.name)
+        }
+
+        if (!originalFile.renameTo(trashFile)) {
+            Log.e("TimeModifier", "移动原文件到回收站失败")
             tempFile.delete()
             return false
         }
 
-        // 5. 将临时文件内容写入原路径（相当于创建新文件）
-        FileOutputStream(originalFile).use { output ->
-            tempFile.inputStream().use { input -> input.copyTo(output) }
+        // 4. 临时文件重命名为原文件名
+        if (!tempFile.renameTo(originalFile)) {
+            Log.e("TimeModifier", "重命名临时文件失败，尝试恢复原文件")
+            trashFile.renameTo(originalFile)
+            tempFile.delete()
+            return false
         }
 
-        // 6. 再次设置新文件的最后修改时间（确保精确）
-        originalFile.setLastModified(targetTimeMillis)
-
-        // 7. 删除临时文件
-        tempFile.delete()
-
-        // 8. 通知媒体库更新
+        // 5. 只做媒体扫描，不手动删除原 URI，避免权限问题
         MediaScannerConnection.scanFile(
             context,
             arrayOf(originalFile.absolutePath),
             null
         ) { _, mediaUri ->
-            if (mediaUri != null) updateMediaStoreTimestamp(context, mediaUri, targetTimeMillis)
+            if (mediaUri != null) {
+                updateMediaStoreTimestamp(context, mediaUri, targetTimeMillis)
+            }
         }
+
         return true
     } catch (e: Exception) {
-        Log.e("TimeModifier", "复制修改失败", e)
+        Log.e("TimeModifier", "操作失败", e)
         if (tempFile.exists()) tempFile.delete()
         return false
     }
 }
+
 
 // ─── 主界面 ───
 @OptIn(ExperimentalMaterial3Api::class)
@@ -173,9 +191,7 @@ fun FileTimeModifierApp() {
     var selectedDate by remember { mutableStateOf(LocalDate.now()) }
     var selectedTime by remember { mutableStateOf(LocalTime.now()) }
     var showConfirmDialog by remember { mutableStateOf(false) }
-
-    // 记录当前选择的修改模式： "direct" 或 "copy"
-    var modifyMode by remember { mutableStateOf("") }
+    var modifyMode by remember { mutableStateOf("") } // "direct" 或 "copy"
     val context = LocalContext.current
 
     val fileLauncher = rememberLauncherForActivityResult(
@@ -205,7 +221,6 @@ fun FileTimeModifierApp() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 按钮区域：左侧浏览，右侧两个操作按钮垂直排列
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
@@ -242,7 +257,7 @@ fun FileTimeModifierApp() {
         }
     }
 
-    // 日期选择对话框（与之前相同）
+    // 日期选择
     if (showDatePicker) {
         val datePickerState = rememberDatePickerState()
         DatePickerDialog(
@@ -265,7 +280,7 @@ fun FileTimeModifierApp() {
         }
     }
 
-    // 时间选择对话框
+    // 时间选择
     if (showTimePicker) {
         val timePickerState = rememberTimePickerState()
         AlertDialog(
@@ -285,22 +300,20 @@ fun FileTimeModifierApp() {
         )
     }
 
-    // 最终确认对话框（根据模式显示不同提示）
+    // 最终确认对话框
     if (showConfirmDialog) {
         val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
         val timeStr = LocalDateTime.of(selectedDate, selectedTime).format(formatter)
         val modeText = if (modifyMode == "direct") {
             "（直接修改源文件的最后修改时间）"
         } else {
-            "（通过复制-删除-重命名修改所有时间，包括创建时间）"
+            "（原文件将移至 DCIM/.Trash，并创建新文件，其修改时间设为 $timeStr）"
         }
 
         AlertDialog(
             onDismissRequest = { showConfirmDialog = false },
             title = { Text("确认修改") },
-            text = {
-                Text("将所选文件的时间设置为：\n$timeStr\n$modeText")
-            },
+            text = { Text("将所选文件的时间设置为：\n$timeStr\n$modeText") },
             confirmButton = {
                 TextButton(onClick = {
                     val timestamp = LocalDateTime.of(selectedDate, selectedTime)
@@ -308,25 +321,26 @@ fun FileTimeModifierApp() {
 
                     var successCount = 0
                     selectedUris.forEach { uri ->
-                        val ok = if (modifyMode == "direct") {
-                            // 直接修改源文件时间
-                            val path = getRealPathFromUri(context, uri)
-                            if (path != null) {
-                                val file = File(path)
-                                val result = file.setLastModified(timestamp)
-                                if (result) {
-                                    MediaScannerConnection.scanFile(context, arrayOf(path), null) { _, mediaUri ->
-                                        if (mediaUri != null) updateMediaStoreTimestamp(context, mediaUri, timestamp)
+                        when (modifyMode) {
+                            "direct" -> {
+                                val path = getRealPathFromUri(context, uri)
+                                if (path != null) {
+                                    val file = File(path)
+                                    if (file.setLastModified(timestamp)) {
+                                        successCount++
+                                        MediaScannerConnection.scanFile(context, arrayOf(path), null) { _, mediaUri ->
+                                            if (mediaUri != null) updateMediaStoreTimestamp(context, mediaUri, timestamp)
+                                        }
                                     }
                                 }
-                                result
-                            } else false
-                        } else {
-                            // 通过复制-删除-重命名修改所有时间
-                            modifyFileByCopyRename(context, uri, timestamp)
+                            }
+                            "copy" -> {
+                                val ok = modifyFileByCreateTemp(context, uri, timestamp)
+                                if (ok) successCount++
+                            }
                         }
-                        if (ok) successCount++
                     }
+
                     showConfirmDialog = false
                     Toast.makeText(context, "已处理 $successCount/${selectedUris.size} 个文件", Toast.LENGTH_SHORT).show()
                 }) { Text("确定") }
