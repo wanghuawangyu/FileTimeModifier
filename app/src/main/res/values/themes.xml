@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 注意名称末尾是 "Modifier"，不是 "Modifie" -->
+    <style name="Theme.FileTimeModifier" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- 可以留空，或稍后自定义颜色 -->
+    </style>
+</resources>
